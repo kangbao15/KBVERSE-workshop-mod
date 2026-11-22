@@ -1,0 +1,14 @@
+{
+  "type": "module",
+  "name": "@kbverse/workshop",
+  "devDependencies": {
+    "vite": "^7.1.0"
+  },
+  "scripts": {
+    "preview": "vite preview --host 0.0.0.0 --port 5180",
+    "dev": "vite --host 0.0.0.0 --port 5180",
+    "build": "vite build"
+  },
+  "private": true,
+  "version": "0.1.0"
+}
