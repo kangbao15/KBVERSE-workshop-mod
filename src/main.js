@@ -1,4 +1,18 @@
-const API_BASE = (import.meta.env.VITE_WORKSHOP_API_URL || "/api/v1").replace(/\/+$/, "");
+import {
+  isFirebaseConfigured,
+  watchAuth,
+  loginWithGoogle,
+  loginWithGithub,
+  loginWithEmail,
+  registerWithEmail,
+  logoutUser,
+  fetchMods,
+  fetchMyUploads,
+  fetchModById,
+  createMod,
+  deleteMod,
+  incrementDownload
+} from "./firebase.js";
 
 const categories = [
   { id: "mod", name: "Mods", icon: "🧩", description: "Mở rộng chức năng KBVERSE" },
@@ -12,30 +26,15 @@ const state = {
   query: "",
   sort: "popular",
   items: [],
-  loading: false,
-  error: "",
-  detail: null
+  user: null,
+  authReady: false,
+  authMode: "login"
 };
 
 const $ = selector => document.querySelector(selector);
 const escapeHTML = value => String(value ?? "").replace(/[&<>"']/g, char => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
 })[char]);
-
-async function api(path, options = {}) {
-  const response = await fetch(API_BASE + path, {
-    credentials: "include",
-    ...options
-  });
-
-  const data = await response.json().catch(() => ({}));
-
-  if (!response.ok) {
-    throw new Error(data.message || data.error || `Server returned ${response.status}`);
-  }
-
-  return data;
-}
 
 function iconFor(category) {
   return categories.find(item => item.id === category)?.icon || "📦";
@@ -46,10 +45,15 @@ function formatNumber(value) {
   return Number.isFinite(n) ? new Intl.NumberFormat("vi-VN").format(n) : "0";
 }
 
-function coverURL(value) {
+function formatPrice(price) {
+  const n = Number(price);
+  if (!Number.isFinite(n) || n <= 0) return "Free";
+  return new Intl.NumberFormat("vi-VN").format(n) + "đ";
+}
+
+function safeURL(value) {
   if (!value || typeof value !== "string") return "";
   if (value.startsWith("/")) return escapeHTML(value);
-
   try {
     const url = new URL(value);
     return ["https:", "http:"].includes(url.protocol) ? escapeHTML(url.href) : "";
@@ -59,13 +63,14 @@ function coverURL(value) {
 }
 
 function listingCard(item, uploads = false) {
-  const id = escapeHTML(item.id || item.slug || "");
-  const name = escapeHTML(item.name || item.title || "Untitled");
+  const id = escapeHTML(item.id || "");
+  const name = escapeHTML(item.name || "Untitled");
   const category = escapeHTML(item.category || "mod");
-  const author = escapeHTML(item.author?.name || item.author || "Unknown creator");
+  const author = escapeHTML(item.authorName || item.author || "Creator");
   const description = escapeHTML(item.description || "");
-  const cover = coverURL(item.coverUrl || item.cover);
-  const version = escapeHTML(item.latestVersion || item.version || "Unknown");
+  const cover = safeURL(item.coverUrl || item.cover);
+  const version = escapeHTML(item.latestVersion || item.version || "1.0.0");
+  const priceLabel = formatPrice(item.price);
 
   const image = cover
     ? `<img src="${cover}" alt="${name}" loading="lazy" onerror="this.style.display='none'">`
@@ -80,14 +85,16 @@ function listingCard(item, uploads = false) {
       <div class="card-body">
         <div class="card-heading">
           <h3>${name}</h3>
-          <span class="version">v${version}</span>
+          <span class="version">v${version} · ${escapeHTML(priceLabel)}</span>
         </div>
         <p class="card-description">${description}</p>
         <div class="creator">by ${author}</div>
         <div class="card-footer">
           <span>↓ ${formatNumber(item.downloads)}</span>
-          <span>★ ${item.rating == null ? "No rating" : escapeHTML(item.rating)}</span>
-          ${uploads ? `<span class="upload-status">${escapeHTML(item.status || "Pending")}</span>` : ""}
+          <span>★ ${item.rating == null ? "New" : escapeHTML(item.rating)}</span>
+          ${uploads
+            ? `<button class="outline-button" style="padding:4px 10px;font-size:12px" data-action="delete-mod" data-id="${id}">Xóa</button>`
+            : `<span class="upload-status">${escapeHTML(priceLabel)}</span>`}
         </div>
       </div>
     </article>
@@ -102,8 +109,8 @@ function renderCards(items, uploads = false) {
         <h3>${uploads ? "Chưa có nội dung đã đăng" : "Chưa có mod được xuất bản"}</h3>
         <p>${uploads
           ? "Các nội dung bạn đăng sẽ xuất hiện tại đây."
-          : "Danh mục này sẽ hiển thị nội dung thật khi Workshop Backend được kết nối."}</p>
-        ${uploads ? `<button class="primary-button" data-page="upload">Đăng nội dung đầu tiên</button>` : ""}
+          : "Hãy là người đầu tiên chia sẻ mod lên KB Workshop!"}</p>
+        <button class="primary-button" data-page="upload">Đăng nội dung đầu tiên</button>
       </div>
     `;
   }
@@ -125,6 +132,26 @@ function pageTitle() {
   return titles[state.page] || titles.discover;
 }
 
+function renderAuthArea() {
+  const container = $("#auth-actions");
+  if (!container) return;
+
+  if (!state.user) {
+    container.innerHTML = `
+      <button class="outline-button" data-action="open-auth">Đăng nhập</button>
+      <button class="primary-button" data-page="upload">+ Publish</button>
+    `;
+    return;
+  }
+
+  const name = escapeHTML(state.user.displayName || state.user.email?.split("@")[0] || "Creator");
+  container.innerHTML = `
+    <button class="outline-button" data-page="uploads">${name}</button>
+    <button class="primary-button" data-page="upload">+ Publish</button>
+    <button class="outline-button" data-action="logout" title="Đăng xuất">Thoát</button>
+  `;
+}
+
 function renderShell() {
   $("#app").innerHTML = `
     <header class="topbar">
@@ -140,9 +167,10 @@ function renderShell() {
       </div>
 
       <div class="top-actions">
-        <span id="connection" class="connection"><i></i> Checking API</span>
-        <button class="outline-button" data-page="uploads">My Uploads</button>
-        <button class="primary-button" data-page="upload">+ Publish</button>
+        <span id="connection" class="connection ${isFirebaseConfigured ? "online" : ""}">
+          <i></i> ${isFirebaseConfigured ? "Firebase Online" : "Thiếu config"}
+        </span>
+        <div id="auth-actions" style="display:flex;gap:8px;align-items:center"></div>
       </div>
     </header>
 
@@ -163,7 +191,7 @@ function renderShell() {
         <div class="sidebar-bottom">
           <div class="sidebar-logo">KBVERSE</div>
           <p>One world. Endless creations.</p>
-          <span>KB Workshop · v0.1.0</span>
+          <span>KB Workshop · v0.2.0</span>
         </div>
       </aside>
 
@@ -178,15 +206,13 @@ function renderShell() {
     <div id="modal-root"></div>
   `;
 
+  renderAuthArea();
   document.addEventListener("click", handleClick);
   $("#search").addEventListener("input", event => {
     state.query = event.target.value;
-    if (state.page !== "discover" && state.page !== "mods" &&
-        state.page !== "shaders" && state.page !== "assets" &&
-        state.page !== "tools") return;
-
+    if (!["discover", "mods", "shaders", "assets", "tools"].includes(state.page)) return;
     clearTimeout(window.__kbSearchTimer);
-    window.__kbSearchTimer = setTimeout(loadListings, 300);
+    window.__kbSearchTimer = setTimeout(loadListings, 250);
   });
 }
 
@@ -254,7 +280,6 @@ function renderListingPage() {
           <option value="popular">Most popular</option>
           <option value="newest">Recently added</option>
           <option value="top-rated">Top rated</option>
-          <option value="downloads">Most downloaded</option>
         </select>
       </div>
       <div id="listing-result">
@@ -283,34 +308,25 @@ async function loadListings() {
     tools: "tool"
   };
 
-  const params = new URLSearchParams({
-    query: state.query,
-    sort: state.sort,
-    page: "1",
-    limit: "24"
-  });
-
-  if (categoryMap[state.page]) params.set("category", categoryMap[state.page]);
-
   try {
-    const result = await api("/mods?" + params.toString());
-    const items = Array.isArray(result) ? result : (result.items || result.mods || []);
+    const items = await fetchMods({
+      category: categoryMap[state.page] || "",
+      search: state.query,
+      sort: state.sort
+    });
     state.items = items;
-
-    $("#connection").innerHTML = "<i></i> API Connected";
+    $("#connection").innerHTML = "<i></i> Firebase Online";
     $("#connection").classList.add("online");
-
     output.innerHTML = renderCards(items);
   } catch (error) {
     state.items = [];
-    $("#connection").innerHTML = "<i></i> API Offline";
+    $("#connection").innerHTML = "<i></i> Lỗi kết nối";
     $("#connection").classList.remove("online");
-
     output.innerHTML = `
       <div class="api-state">
         <div class="api-symbol">⌁</div>
-        <h3>Workshop Backend chưa kết nối</h3>
-        <p>Website riêng đã sẵn sàng. Để tải và hiển thị các mod đã xuất bản, cần kết nối Workshop API.</p>
+        <h3>Không thể tải danh sách mod</h3>
+        <p>Kiểm tra cấu hình Firebase hoặc Firestore Security Rules.</p>
         <span>${escapeHTML(error.message)}</span>
       </div>
     `;
@@ -318,6 +334,19 @@ async function loadListings() {
 }
 
 async function loadUploads() {
+  if (!state.user) {
+    $("#page-content").innerHTML = `
+      ${pageHeader("My Uploads", "Quản lý nội dung bạn đã đăng.")}
+      <div class="api-state">
+        <div class="api-symbol">♙</div>
+        <h3>Đăng nhập để xem My Uploads</h3>
+        <p>Đăng nhập bằng GitHub, Google hoặc Email để quản lý mod của bạn.</p>
+        <button class="primary-button" data-action="open-auth">Đăng nhập / Đăng ký</button>
+      </div>
+    `;
+    return;
+  }
+
   $("#page-content").innerHTML = `
     ${pageHeader("My Uploads", "Quản lý nội dung bạn đã đăng.")}
     <section class="listing-section"><div id="listing-result">
@@ -326,15 +355,13 @@ async function loadUploads() {
   `;
 
   try {
-    const result = await api("/me/uploads");
-    const items = Array.isArray(result) ? result : (result.items || result.mods || []);
+    const items = await fetchMyUploads(state.user.uid);
     $("#listing-result").innerHTML = renderCards(items, true);
   } catch (error) {
     $("#listing-result").innerHTML = `
       <div class="api-state">
-        <div class="api-symbol">♙</div>
-        <h3>Chưa thể tải My Uploads</h3>
-        <p>Chức năng này cần Workshop Backend và phiên đăng nhập hợp lệ.</p>
+        <div class="api-symbol">⌁</div>
+        <h3>Không tải được My Uploads</h3>
         <span>${escapeHTML(error.message)}</span>
       </div>
     `;
@@ -342,44 +369,62 @@ async function loadUploads() {
 }
 
 function renderUploadPage() {
+  if (!state.user) {
+    $("#page-content").innerHTML = `
+      ${pageHeader("Publish content", "Chia sẻ sáng tạo của bạn với cộng đồng KBVERSE.")}
+      <div class="api-state">
+        <div class="api-symbol">＋</div>
+        <h3>Đăng nhập để đăng mod lên Workshop</h3>
+        <p>Hỗ trợ đăng nhập nhanh bằng GitHub, Google hoặc Email.</p>
+        <button class="primary-button" data-action="open-auth">Đăng nhập / Đăng ký ngay</button>
+      </div>
+    `;
+    return;
+  }
+
   $("#page-content").innerHTML = `
     ${pageHeader("Publish content", "Chia sẻ sáng tạo của bạn với cộng đồng KBVERSE.")}
     <form id="upload-form" class="upload-form">
       <div class="form-section">
         <div class="form-section-heading"><span>01</span><div><h2>Content details</h2><p>Thông tin hiển thị trên Workshop.</p></div></div>
 
-        <label>Content name<input name="name" required maxlength="100" placeholder="Tên nội dung"></label>
-        <label>Category
-          <select name="category" required>
-            <option value="mod">Mod</option>
-            <option value="shader">Shader</option>
-            <option value="asset">Asset</option>
-            <option value="tool">Tool</option>
-          </select>
-        </label>
-        <label>Description<textarea name="description" required maxlength="3000" rows="5" placeholder="Mô tả nội dung của bạn..."></textarea></label>
+        <label>Content name<input name="name" required maxlength="100" placeholder="Tên mod / shader / asset"></label>
         <div class="form-row">
-          <label>KBVERSE compatibility<input name="compatibility" required placeholder="Ví dụ: 2.0.x"></label>
-          <label>Hardware requirements<input name="hardware" placeholder="Ví dụ: GPU requirements"></label>
+          <label>Category
+            <select name="category" required>
+              <option value="mod">Mod</option>
+              <option value="shader">Shader</option>
+              <option value="asset">Asset</option>
+              <option value="tool">Tool</option>
+            </select>
+          </label>
+          <label>Version<input name="version" required value="1.0.0" placeholder="1.0.0"></label>
         </div>
-        <label>Changelog<textarea name="changelog" rows="3" placeholder="Thay đổi trong phiên bản này..."></textarea></label>
+        <label>Description<textarea name="description" required maxlength="3000" rows="4" placeholder="Mô tả tính năng nội dung của bạn..."></textarea></label>
+        <div class="form-row">
+          <label>KBVERSE compatibility<input name="compatibility" required value="1.0.x" placeholder="Ví dụ: 1.0.x"></label>
+          <label>Giá bán (VNĐ — nhập 0 nếu Miễn phí)<input name="price" type="number" min="0" step="1000" value="0"></label>
+        </div>
+        <label>Link thanh toán / liên hệ mua (nếu đặt giá > 0)<input name="purchaseUrl" type="url" placeholder="https://... (để trống nếu miễn phí)"></label>
+        <label>Cover image URL (tùy chọn)<input name="coverUrl" type="url" placeholder="https://...png hoặc .jpg"></label>
+        <label>Changelog<textarea name="changelog" rows="2" placeholder="Thay đổi trong phiên bản này..."></textarea></label>
       </div>
 
       <div class="form-section">
-        <div class="form-section-heading"><span>02</span><div><h2>Upload package</h2><p>File phân phối cho người dùng.</p></div></div>
+        <div class="form-section-heading"><span>02</span><div><h2>Package source</h2><p>Chọn file .kbmod.json (lưu trực tiếp) hoặc dán link tải gói (.zip / GitHub Release).</p></div></div>
         <label class="file-drop">
           <span class="file-icon">⇧</span>
-          <strong id="file-name">Chọn package để tải lên</strong>
-          <small>Mod: .kbmod.json · Các danh mục khác: .zip</small>
-          <input name="package" type="file" accept=".json,.kbmod.json,.zip" required>
+          <strong id="file-name">Chọn file .kbmod.json (tùy chọn nếu đã có link tải)</strong>
+          <small>Mod JSON dưới 700 KB sẽ được lưu trực tiếp trên Workshop</small>
+          <input name="package" type="file" accept=".json,.kbmod.json">
         </label>
-        <label>Cover image (optional)<input name="cover" type="file" accept="image/png,image/jpeg,image/webp"></label>
+        <label>Hoặc link tải trực tiếp (.zip / GitHub Release)<input name="downloadUrl" type="url" placeholder="https://github.com/.../releases/download/..."></label>
         <div id="package-feedback" class="feedback"></div>
       </div>
 
       <div class="form-actions">
-        <p>Việc đăng công khai cần được Workshop Backend xác thực và kiểm duyệt.</p>
-        <button type="submit" class="primary-button large">Submit for review ↗</button>
+        <p>Đăng dưới tên: <strong>${escapeHTML(state.user.displayName || state.user.email)}</strong></p>
+        <button type="submit" class="primary-button large">Publish ngay ↗</button>
       </div>
     </form>
   `;
@@ -387,7 +432,7 @@ function renderUploadPage() {
   const form = $("#upload-form");
   form.querySelector('[name="package"]').addEventListener("change", event => {
     const file = event.target.files[0];
-    $("#file-name").textContent = file ? file.name : "Chọn package để tải lên";
+    $("#file-name").textContent = file ? file.name : "Chọn file .kbmod.json (tùy chọn nếu đã có link tải)";
   });
 
   form.addEventListener("submit", submitUpload);
@@ -399,90 +444,172 @@ async function submitUpload(event) {
   const form = event.currentTarget;
   const formData = new FormData(form);
   const file = formData.get("package");
-  const category = formData.get("category");
+  const downloadUrl = String(formData.get("downloadUrl") || "").trim();
   const feedback = $("#package-feedback");
 
-  if (!(file instanceof File) || !file.size) {
-    feedback.textContent = "Chưa chọn package.";
-    return;
-  }
+  let inlineJson = "";
+  let fileName = "";
 
-  if (file.size > 100 * 1024 * 1024) {
-    feedback.textContent = "Package vượt quá giới hạn 100 MB.";
-    return;
-  }
-
-  if (category === "mod") {
-    try {
-      const pkg = JSON.parse(await file.text());
-      const m = pkg.manifest;
-
-      if (!m || typeof m.id !== "string" || !m.name ||
-          !/^\d+\.\d+\.\d+$/.test(m.version || "") ||
-          m.apiVersion !== 1 || typeof pkg.source !== "string") {
-        throw new Error("Manifest không đúng định dạng KB Loader API v1.");
-      }
-    } catch (error) {
-      feedback.textContent = "Package mod không hợp lệ: " + error.message;
+  if (file instanceof File && file.size > 0) {
+    if (file.size > 700 * 1024) {
+      feedback.textContent = "File JSON vượt 700 KB. Hãy up lên GitHub Release rồi dán link vào ô bên dưới.";
       return;
     }
-  } else if (!file.name.toLowerCase().endsWith(".zip")) {
-    feedback.textContent = "Danh mục này cần package .zip.";
+    try {
+      const rawText = await file.text();
+      JSON.parse(rawText);
+      inlineJson = rawText;
+      fileName = file.name;
+    } catch (error) {
+      feedback.textContent = "File JSON không hợp lệ: " + error.message;
+      return;
+    }
+  }
+
+  if (!inlineJson && !downloadUrl) {
+    feedback.textContent = "Hãy chọn file .kbmod.json hoặc nhập link tải package.";
     return;
   }
 
-  feedback.textContent = "Đang gửi package lên Workshop...";
+  feedback.textContent = "Đang xuất bản lên KB Workshop...";
   const button = form.querySelector('[type="submit"]');
   button.disabled = true;
 
   try {
-    await api("/mods", {
-      method: "POST",
-      body: formData
+    await createMod({
+      name: String(formData.get("name") || "").trim(),
+      category: String(formData.get("category") || "mod"),
+      latestVersion: String(formData.get("version") || "1.0.0").trim(),
+      description: String(formData.get("description") || "").trim(),
+      compatibility: String(formData.get("compatibility") || "1.0.x").trim(),
+      price: Number(formData.get("price") || 0),
+      purchaseUrl: String(formData.get("purchaseUrl") || "").trim(),
+      coverUrl: String(formData.get("coverUrl") || "").trim(),
+      changelog: String(formData.get("changelog") || "").trim(),
+      inlineJson,
+      fileName,
+      downloadUrl
     });
 
-    feedback.textContent = "Đã gửi nội dung. Chờ hệ thống kiểm duyệt.";
-    form.reset();
-    $("#file-name").textContent = "Chọn package để tải lên";
+    showNotice("Đã xuất bản thành công!");
+    state.page = "uploads";
+    renderPage();
   } catch (error) {
-    feedback.textContent =
-      "Chưa thể đăng: " + error.message +
-      ". Cần Workshop Backend và tài khoản được xác thực.";
+    feedback.textContent = "Lỗi khi đăng: " + error.message;
   } finally {
     button.disabled = false;
   }
 }
 
+function openAuthModal(mode = "login") {
+  state.authMode = mode;
+  const isRegister = mode === "register";
+
+  $("#modal-root").innerHTML = `
+    <div class="modal-backdrop" data-action="close-modal">
+      <section class="detail-modal" role="dialog" aria-modal="true" style="max-width:420px">
+        <button class="modal-close" data-action="close-modal">✕</button>
+        <div class="eyebrow">KBVERSE ACCOUNT</div>
+        <h2>${isRegister ? "Tạo tài khoản Creator" : "Đăng nhập KB Workshop"}</h2>
+        <p class="creator" style="margin-bottom:16px">Đăng nhập nhanh để đăng và quản lý mod của bạn.</p>
+
+        <div style="display:grid;gap:10px;margin-bottom:16px">
+          <button type="button" class="primary-button" style="justify-content:center;width:100%" data-action="auth-github">
+            Tiếp tục với GitHub
+          </button>
+          <button type="button" class="outline-button" style="justify-content:center;width:100%" data-action="auth-google">
+            Tiếp tục với Google
+          </button>
+        </div>
+
+        <form id="auth-form" style="display:grid;gap:10px">
+          ${isRegister ? `<input name="name" required placeholder="Tên hiển thị (ví dụ: KangBao15)" style="padding:10px;border-radius:8px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.04);color:inherit">` : ""}
+          <input name="email" type="email" required placeholder="Email" style="padding:10px;border-radius:8px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.04);color:inherit">
+          <input name="password" type="password" required minlength="6" placeholder="Mật khẩu (tối thiểu 6 ký tự)" style="padding:10px;border-radius:8px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.04);color:inherit">
+          <div id="auth-feedback" class="feedback" style="color:#ff8a8a;font-size:13px"></div>
+          <button type="submit" class="primary-button" style="justify-content:center;width:100%">
+            ${isRegister ? "Đăng ký bằng Email" : "Đăng nhập bằng Email"}
+          </button>
+        </form>
+
+        <p style="margin-top:14px;font-size:13px;text-align:center">
+          ${isRegister
+            ? `Đã có tài khoản? <a href="#" data-action="switch-auth" data-mode="login">Đăng nhập</a>`
+            : `Chưa có tài khoản? <a href="#" data-action="switch-auth" data-mode="register">Đăng ký ngay</a>`}
+        </p>
+      </section>
+    </div>
+  `;
+
+  $("#auth-form").addEventListener("submit", async event => {
+    event.preventDefault();
+    const fd = new FormData(event.currentTarget);
+    const fb = $("#auth-feedback");
+    fb.textContent = "Đang xử lý...";
+
+    try {
+      if (isRegister) {
+        await registerWithEmail(
+          String(fd.get("name") || ""),
+          String(fd.get("email") || ""),
+          String(fd.get("password") || "")
+        );
+      } else {
+        await loginWithEmail(
+          String(fd.get("email") || ""),
+          String(fd.get("password") || "")
+        );
+      }
+      $("#modal-root").innerHTML = "";
+      showNotice("Đăng nhập thành công!");
+    } catch (error) {
+      fb.textContent = error.message;
+    }
+  });
+}
+
 async function openDetails(id) {
   try {
-    const result = await api("/mods/" + encodeURIComponent(id));
-    const item = result.mod || result;
+    const item = await fetchModById(id);
 
-    const name = escapeHTML(item.name || item.title);
-    const cover = coverURL(item.coverUrl || item.cover);
-    const author = escapeHTML(item.author?.name || item.author || "Unknown");
+    const name = escapeHTML(item.name || "Untitled");
+    const cover = safeURL(item.coverUrl || item.cover);
+    const author = escapeHTML(item.authorName || item.author || "Creator");
     const description = escapeHTML(item.description || "");
-    const version = escapeHTML(item.latestVersion || item.version || "");
+    const version = escapeHTML(item.latestVersion || item.version || "1.0.0");
     const changelog = escapeHTML(item.changelog || "No changelog provided.");
-    const downloadURL = API_BASE + "/mods/" + encodeURIComponent(id) + "/download";
+    const isPaid = Number(item.price) > 0;
+    const purchaseUrl = safeURL(item.purchaseUrl);
+    const downloadUrl = safeURL(item.downloadUrl);
+
+    let actionButton = "";
+    if (isPaid && purchaseUrl) {
+      actionButton = `<a class="primary-button large download-button" href="${purchaseUrl}" target="_blank" rel="noopener">Mua gói (${escapeHTML(formatPrice(item.price))}) ↗</a>`;
+    } else if (item.inlineJson) {
+      actionButton = `<button class="primary-button large download-button" data-action="download-inline" data-id="${escapeHTML(item.id)}">Download ${escapeHTML(item.fileName || "mod.kbmod.json")} ↓</button>`;
+    } else if (downloadUrl) {
+      actionButton = `<a class="primary-button large download-button" data-action="track-download" data-id="${escapeHTML(item.id)}" href="${downloadUrl}" target="_blank" rel="noopener">Download package ↓</a>`;
+    } else {
+      actionButton = `<span class="detail-note">Creator chưa đính kèm link tải.</span>`;
+    }
 
     $("#modal-root").innerHTML = `
       <div class="modal-backdrop" data-action="close-modal">
         <section class="detail-modal" role="dialog" aria-modal="true">
           <button class="modal-close" data-action="close-modal">✕</button>
           ${cover ? `<img class="detail-cover" src="${cover}" alt="">` : ""}
-          <div class="eyebrow">${escapeHTML(item.category || "MOD")}</div>
+          <div class="eyebrow">${escapeHTML(item.category || "MOD")} · ${escapeHTML(formatPrice(item.price))}</div>
           <h2>${name}</h2>
           <p class="creator">by ${author} · v${version}</p>
           <p>${description}</p>
           <div class="detail-meta">
             <span>Downloads: ${formatNumber(item.downloads)}</span>
-            <span>Rating: ${item.rating == null ? "Not rated" : escapeHTML(item.rating)}</span>
+            <span>Price: ${escapeHTML(formatPrice(item.price))}</span>
             <span>KBVERSE: ${escapeHTML(item.compatibility || "Not specified")}</span>
           </div>
           <h3>Changelog</h3>
           <p>${changelog}</p>
-          <a class="primary-button large download-button" href="${escapeHTML(downloadURL)}">Download package ↓</a>
+          ${actionButton}
           <p class="detail-note">Chỉ tải và cài mod từ nguồn bạn tin tưởng.</p>
         </section>
       </div>
@@ -512,13 +639,90 @@ async function handleClick(event) {
     return;
   }
 
-  if (button.dataset.action === "close-modal") {
-    $("#modal-root").innerHTML = "";
+  const action = button.dataset.action;
+
+  if (action === "close-modal") {
+    if (event.target === button || button.classList.contains("modal-close")) {
+      $("#modal-root").innerHTML = "";
+    }
     return;
   }
 
-  if (button.dataset.action === "detail") {
+  if (action === "open-auth") {
+    openAuthModal("login");
+    return;
+  }
+
+  if (action === "switch-auth") {
+    event.preventDefault();
+    openAuthModal(button.dataset.mode || "login");
+    return;
+  }
+
+  if (action === "auth-google") {
+    try {
+      await loginWithGoogle();
+      $("#modal-root").innerHTML = "";
+      showNotice("Đã đăng nhập bằng Google!");
+    } catch (error) {
+      const fb = $("#auth-feedback");
+      if (fb) fb.textContent = error.message;
+    }
+    return;
+  }
+
+  if (action === "auth-github") {
+    try {
+      await loginWithGithub();
+      $("#modal-root").innerHTML = "";
+      showNotice("Đã đăng nhập bằng GitHub!");
+    } catch (error) {
+      const fb = $("#auth-feedback");
+      if (fb) fb.textContent = error.message;
+    }
+    return;
+  }
+
+  if (action === "logout") {
+    await logoutUser();
+    showNotice("Đã đăng xuất.");
+    renderPage();
+    return;
+  }
+
+  if (action === "detail") {
     await openDetails(button.dataset.id);
+    return;
+  }
+
+  if (action === "download-inline") {
+    const item = await fetchModById(button.dataset.id);
+    if (!item.inlineJson) return;
+    const blob = new Blob([item.inlineJson], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = item.fileName || "mod.kbmod.json";
+    a.click();
+    URL.revokeObjectURL(url);
+    void incrementDownload(item.id);
+    return;
+  }
+
+  if (action === "track-download") {
+    void incrementDownload(button.dataset.id);
+    return;
+  }
+
+  if (action === "delete-mod") {
+    if (!confirm("Xóa nội dung này khỏi Workshop?")) return;
+    try {
+      await deleteMod(button.dataset.id);
+      showNotice("Đã xóa nội dung.");
+      await loadUploads();
+    } catch (error) {
+      showNotice("Lỗi khi xóa: " + error.message);
+    }
   }
 }
 
@@ -536,4 +740,12 @@ function renderPage() {
 }
 
 renderShell();
+watchAuth(user => {
+  state.user = user;
+  state.authReady = true;
+  renderAuthArea();
+  if (state.page === "upload" || state.page === "uploads") {
+    renderPage();
+  }
+});
 renderPage();
