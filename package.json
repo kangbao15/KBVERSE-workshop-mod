@@ -10,5 +10,8 @@
     "build": "vite build"
   },
   "private": true,
-  "version": "0.1.0"
+  "version": "0.1.0",
+  "dependencies": {
+    "firebase": "^13.4.0"
+  }
 }
